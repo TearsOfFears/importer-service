@@ -1,0 +1,10 @@
+services:
+  api:
+    build: .
+    ports:
+      - ${PORT}:${PORT}
+    env_file:
+      - .env
+    volumes:
+      - ./results:/app/results
+      - ./config:/app/config
