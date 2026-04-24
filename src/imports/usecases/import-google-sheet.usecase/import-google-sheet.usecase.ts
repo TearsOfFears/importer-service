@@ -15,10 +15,17 @@ import {
 } from '../../../common/services/google-sheets.service.interface';
 import { ConfigService } from '@nestjs/config';
 import { mkdirSync } from 'fs';
-
+import { pipeline } from 'stream/promises';
+import { Readable, Transform, Writable } from 'stream';
 import { ImportGoogleSheetUseCaseInput } from './import-google-sheet.usecase.input';
-
 import { CsvBatchWriterUtil } from '../../../common/utils/csv-batch-write.util';
+
+interface ImportStats {
+  totalRows: number;
+  validRows: number;
+  invalidRows: number;
+}
+
 @Injectable()
 export class ImportGoogleSheetUseCase {
   private readonly logger = new Logger(ImportGoogleSheetUseCase.name);
@@ -81,7 +88,7 @@ export class ImportGoogleSheetUseCase {
     sheetName: string;
     writer: CsvBatchWriterUtil;
   }) {
-    this.logger.log('Streaming rows from Google Sheet');
+    this.logger.log('Streaming rows from Google Sheet (pipeline mode)');
 
     const stats = {
       totalRows: 0,
@@ -89,34 +96,25 @@ export class ImportGoogleSheetUseCase {
       invalidRows: 0,
     };
 
-    const claimedCatIds = new Set<string>();
-    let headerIndex: Map<string, number> | null = null;
-
-    for await (const row of this.googleSheets.streamSheetRows(
+    const readable = this.createReadableStream(
       ctx.spreadsheetId,
       ctx.sheetName,
-    )) {
-      if (!headerIndex) {
-        headerIndex = this.buildHeaderIndex(row);
-        continue;
-      }
+    );
 
-      stats.totalRows++;
+    const transform = this.createTransformStream(stats);
+    const writable = this.createWritableStream(ctx.writer);
 
-      const result = this.transformRow(row, headerIndex, claimedCatIds);
-
-      if (!result.valid) {
-        stats.invalidRows++;
-        continue;
-      }
-
-      stats.validRows++;
-      ctx.writer.write(result.row);
-    }
-
-    await ctx.writer.close();
+    await pipeline(readable, transform, writable);
 
     return stats;
+  }
+  private createReadableStream(spreadsheetId: string, sheetName: string) {
+    const iterator = this.googleSheets.streamSheetRows(
+      spreadsheetId,
+      sheetName,
+    );
+
+    return Readable.from(iterator);
   }
 
   private transformRow(
@@ -188,5 +186,61 @@ export class ImportGoogleSheetUseCase {
       sheetName:
         this.config.get<string>('GOOGLE_CATS_SHEET_NAME') ?? 'CatsData',
     };
+  }
+
+  private createWritableStream(writer: CsvBatchWriterUtil) {
+    return new Writable({
+      objectMode: true,
+
+      write: async (row: CatRow, _, callback) => {
+        try {
+          writer.write(row);
+          callback();
+        } catch (err) {
+          callback(err);
+        }
+      },
+
+      final: async (callback) => {
+        try {
+          await writer.close();
+          callback();
+        } catch (err) {
+          callback(err);
+        }
+      },
+    });
+  }
+
+  private createTransformStream(stats: ImportStats) {
+    let headerIndex: Map<string, number> | null = null;
+    const claimedCatIds = new Set<string>();
+
+    return new Transform({
+      objectMode: true,
+
+      transform: (row: string[], _, callback) => {
+        try {
+          if (!headerIndex) {
+            headerIndex = this.buildHeaderIndex(row);
+            return callback(); // skip header
+          }
+
+          stats.totalRows++;
+
+          const result = this.transformRow(row, headerIndex, claimedCatIds);
+
+          if (!result.valid) {
+            stats.invalidRows++;
+            return callback();
+          }
+
+          stats.validRows++;
+          callback(null, result.row);
+        } catch (err) {
+          callback(err);
+        }
+      },
+    });
   }
 }
